@@ -2,7 +2,7 @@ import re
 
 from datasets import load_dataset
 
-from grpo_tutorial.data.prompt import SYSTEM_PROMPT
+from grpo_tutorial.prompt import SYSTEM_PROMPT
 
 def get_openmath_instruct_answer(response_text: str):
 
@@ -71,7 +71,7 @@ def load_and_preprocess_openinstruct(problem_source: str, num_samples: int, spli
         remove_columns=[
                 name
                 for name in subset_dataset.column_names
-                if name not in ["messages", "answer"]
+                if name not in ["messages", "expected_answer"]
             ],
         desc="Processing individual datapoints",
     )

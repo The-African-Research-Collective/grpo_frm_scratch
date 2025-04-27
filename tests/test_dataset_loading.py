@@ -1,6 +1,6 @@
 import pytest
 
-from grpo_tutorial.data.utils import load_and_preprocess_openinstruct
+from grpo_tutorial.utils import load_and_preprocess_openinstruct
 
 
 def test_loading_dataset():
@@ -14,6 +14,8 @@ def test_loading_dataset():
         num_samples=10,
         split="train_1M"
     )
+
+    print(dataset[0])
 
     # Check if the dataset is loaded correctly
     assert len(dataset) == 10, "Dataset length mismatch"

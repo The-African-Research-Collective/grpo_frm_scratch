@@ -4,6 +4,10 @@ This tutorial is designed to help provide as comprehensive a guide as possible t
 
 There are lots of awesome tutorials that show how to implement GRPO from scratch and we have used some of them as references to creating this documentation. We specifically wanted this to be a perfect blend of oversimplification and complexity.
 
+
+[Weight and Biases Training Report]()
+An interesting thread on [practical tips when implementing GRPO](https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb#file-grpo_demo-py-L90)
+
 ## Table of Contents
 
 - [High level understanding to RL and GRPO](#introduction)
