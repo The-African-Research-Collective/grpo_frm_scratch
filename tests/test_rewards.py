@@ -1,6 +1,6 @@
 import pytest
 
-from grpo_tutorial.rewards import structure_reward, accuracy_reward
+from grpo_tutorial.rewards import structure_reward, accuracy_reward, reward_function
 
 sample_completions = [
     ([[{"role": "assistant", "content": "<thinking>Here's what i'm thinking</thinking>\n<answer>\n42\n</answer>"}]], 42, 1.0, 1.0),
@@ -24,3 +24,17 @@ def test_structure_accuracy_reward(completions, answer, expected_structure_rewar
     # Check if the calculated rewards match the expected rewards
     assert structure_rewards[0] == expected_structure_reward, f"Expected {expected_structure_reward}, but got {structure_rewards[0]}"
     assert accuracy_rewards[0] == expected_accuracy_reward, f"Expected {expected_accuracy_reward}, but got {accuracy_rewards[0]}"
+
+
+@pytest.mark.parametrize("completions, answer, expected_structure_reward, expected_accuracy_reward", sample_completions)
+def test_reward_function(completions, answer, expected_structure_reward, expected_accuracy_reward):
+    """
+    Test the reward function.
+    """
+
+    # Calculate the rewards using the reward function
+    rewards = reward_function(completions, [answer])
+    
+    # Check if the calculated rewards match the expected rewards
+    assert rewards[0] == expected_structure_reward + expected_accuracy_reward, f"Expected {expected_structure_reward + expected_accuracy_reward}, but got {rewards[0]}"
+

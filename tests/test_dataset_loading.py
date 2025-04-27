@@ -1,6 +1,6 @@
 import pytest
 
-from grpo_tutorial.utils import load_and_preprocess_openinstruct
+from grpo_tutorial.data_utils import load_and_preprocess_openinstruct
 
 
 def test_loading_dataset():

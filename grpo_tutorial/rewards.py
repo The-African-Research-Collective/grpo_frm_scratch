@@ -68,3 +68,20 @@ def accuracy_reward(completions, answers):
     rewards = list(map(check_answer, completions, answers))
 
     return rewards
+
+def reward_function(completions, answers):
+    """
+    Given a set of model completions for a given prompt, this function assigns
+    a reward score based on the accuracy of the answer and the structure of the response.
+    """
+
+    # Calculate structure rewards
+    structure_rewards = structure_reward(completions)
+
+    # Calculate accuracy rewards
+    accuracy_rewards = accuracy_reward(completions, answers)
+
+    # Combine the rewards
+    combined_rewards = [structure + accuracy for structure, accuracy in zip(structure_rewards, accuracy_rewards)]
+
+    return combined_rewards
