@@ -5,6 +5,7 @@ from transformers import AutoTokenizer
 from torch.utils.data import Dataset
 from datasets import load_dataset
 from jinja2 import Environment
+from typing import Dict, List
 
 SYSTEM_PROMPT = """You are a helpful assistant for translating documents for low-resource languages
 You first think about the reasoning process to translate the document, and then provide the final answer
@@ -30,6 +31,7 @@ MAPPING = {
     "ha": "Hausa",
     "zu": "Zulu",
 }
+
 
 class AfriDocMTDataset(Dataset):
     def __init__(self, dataset_name_or_path: str, split: str, subset:str, num_samples: str, tokenizer: AutoTokenizer, source_languages: list, target_language: str):
@@ -65,7 +67,8 @@ class AfriDocMTDataset(Dataset):
             "input_ids": input_ids,
             "input_tokens": input_tokens,
             "input_prompt": input_prompt,
-            "target_text": target_text,
+            "expected_output": target_text,
+            "input": source_text
         }
 
     def load_dataset_hgf(self, dataset_name_or_path: str, split: str, subset:str, num_samples: str, source_languages: list, target_language: str):
@@ -89,3 +92,18 @@ class AfriDocMTDataset(Dataset):
             return selected_dataset
         else:
             return selected_dataset.shuffle(seed=42).select(range(num_samples))
+
+def collate_fn(batch: List[Dict]) -> MiniBatch:
+    input_ids = [item["input_ids"] for item in batch]
+    input_tokens = [item["input_tokens"] for item in batch]
+    input_prompts = [item["input_prompt"] for item in batch]
+    expected_outputs = [item["expected_output"] for item in batch]
+    inputs = [item["input"] for item in batch]
+
+    return MiniBatch(
+        input_ids=input_ids,
+        input_tokens=input_tokens,
+        input_prompts=input_prompts,
+        expected_outputs=expected_outputs,
+        inputs=inputs
+    )
