@@ -1,0 +1,15 @@
+model:
+  pretrained_model_path: "Qwen/Qwen2.5-1.5B-Instruct"
+  dtype: "bfloat16"
+vllm:
+  tensor_parallel_size: 1
+  data_parallel_size: 1
+  dtype: "bfloat16"
+data:
+  dataset_name_or_path: "masakhane/AfriDocMT"
+  split: "train"
+  subset: "doc_health_5"
+  num_samples: -1
+  source_languages: ["yo"]
+  target_language: "en"
+  batch_size: 4

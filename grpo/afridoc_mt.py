@@ -2,10 +2,13 @@ import evaluate
 import pandas as pd
 from transformers import AutoTokenizer
 
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+from datasets import Dataset as HfDataset
 from datasets import load_dataset
 from jinja2 import Environment
 from typing import Dict, List
+
+from grpo.data_class import MiniBatch
 
 SYSTEM_PROMPT = """You are a helpful assistant for translating documents for low-resource languages
 You first think about the reasoning process to translate the document, and then provide the final answer
@@ -20,9 +23,9 @@ Please follow these steps to complete the translation:
 
 Here is the document to be translated:
 {source_text}
-"""
 
-RESPONSE_PROMPT = "Here is how i would translate this text\n<think>"
+Here is how i would translate this text\n<think>
+"""
 
 MAPPING = {
     "sw": "Swahili",
@@ -30,6 +33,7 @@ MAPPING = {
     "yo": "Yoruba",
     "ha": "Hausa",
     "zu": "Zulu",
+    "en": "English"
 }
 
 
@@ -37,7 +41,7 @@ class AfriDocMTDataset(Dataset):
     def __init__(self, dataset_name_or_path: str, split: str, subset:str, num_samples: str, tokenizer: AutoTokenizer, source_languages: list, target_language: str):
 
         self.tokenizer = tokenizer
-        self.data = load_dataset_hgf(dataset_name_or_path, split, subset, num_samples, source_languages, target_language)
+        self.data = self.load_dataset_hgf(dataset_name_or_path, split, subset, num_samples, source_languages, target_language)
 
         self.chat_template = Environment().from_string(
             self.tokenizer.chat_template
@@ -54,12 +58,13 @@ class AfriDocMTDataset(Dataset):
         target_text = item['target_text']
 
         user_prompt = USER_PROMPT.format(source_language=source_language, target_language=target_language, source_text=source_text)
+        print(user_prompt)
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
-        input_prompt = self.chat_template.render(messages=(messages, RESPONSE_PROMPT), add_generation_prompt=True)
+        input_prompt = self.chat_template.render(messages=messages, add_generation_prompt=True)
         input_ids = self.tokenizer.encode(input_prompt)
         input_tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
 
@@ -73,7 +78,7 @@ class AfriDocMTDataset(Dataset):
 
     def load_dataset_hgf(self, dataset_name_or_path: str, split: str, subset:str, num_samples: str, source_languages: list, target_language: str):
         all_data = load_dataset(dataset_name_or_path, subset)[split]
-        df = pd.DataFrame(dataset)
+        df = pd.DataFrame(all_data)
 
         total = []
 
@@ -86,7 +91,7 @@ class AfriDocMTDataset(Dataset):
             total.append(trimmed_df)
         
         merged_df = pd.concat(total, ignore_index=True)
-        selected_dataset = Dataset.from_pandas(merged_df)
+        selected_dataset = HfDataset.from_pandas(merged_df)
 
         if num_samples == -1:
             return selected_dataset
@@ -107,3 +112,21 @@ def collate_fn(batch: List[Dict]) -> MiniBatch:
         expected_outputs=expected_outputs,
         inputs=inputs
     )
+
+if __name__ == "__main__":
+    dataset = AfriDocMTDataset(
+        dataset_name_or_path="masakhane/AfriDocMT",
+        split="train",
+        subset="doc_health_5",
+        num_samples=100,
+        tokenizer=AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct"),
+        source_languages=["yo"],
+        target_language="en"
+    )
+
+    print(dataset[0])
+
+    dataloader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn)
+    for batch in dataloader:
+        print(batch)
+        break
