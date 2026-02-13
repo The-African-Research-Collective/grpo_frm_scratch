@@ -1,15 +1,38 @@
 model:
-  pretrained_model_path: "Qwen/Qwen2.5-1.5B-Instruct"
+  pretrained_model_path: "google/gemma-3-4b-it"
   dtype: "bfloat16"
-vllm:
-  tensor_parallel_size: 1
-  data_parallel_size: 1
-  dtype: "bfloat16"
-data:
+
+train_dataset:
   dataset_name_or_path: "masakhane/AfriDocMT"
   split: "train"
   subset: "doc_health_5"
   num_samples: -1
-  source_languages: ["yo"]
+  source_languages:
+    - yo
   target_language: "en"
   batch_size: 4
+  dataset_class_name: "afridoc_mt"
+
+eval_dataset:
+  dataset_name_or_path: "masakhane/AfriDocMT"
+  split: "validation"
+  subset: "doc_health_5"
+  num_samples: 10
+  source_languages:
+    - yo
+  target_language: "en"
+  batch_size: 146
+  dataset_class_name: "afridoc_mt"
+
+rewards:
+  structure_reward:
+    name: "structure_reward"
+    weight: 1
+  translation_reward:
+    name: "translation_reward"
+    weight: 1
+
+training:
+  num_rollouts: 4
+  learning_rate: 1e-5
+  num_epochs: 3
