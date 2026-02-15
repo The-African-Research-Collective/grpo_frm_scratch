@@ -1,3 +1,4 @@
+import torch
 from dataclasses import dataclass
 from typing import List, Dict, Callable
 
@@ -14,7 +15,10 @@ class Group:
     input_text: str
     ground_truth: str
     responses: List[str]
-    rewards: List[Dict]
+    rewards: Dict[str, List]
+    advantages: List[float] = None
+    output_ids: torch.Tensor = None
+    input_ids: torch.Tensor = None
 
 
 @dataclass

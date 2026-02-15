@@ -25,3 +25,4 @@ repos:
         args: [--fix, --exit-non-zero-on-fix]
       # Run ruff formatter
       - id: ruff-format
+        args: [--line-length=300]

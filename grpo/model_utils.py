@@ -16,6 +16,7 @@ def generate_grpo_rollout(
     reward_functions: List[Reward],
     device: torch.device,
     dtype: torch.dtype,
+    temperature: float = 0.5,
 ) -> List[Group]:
     model.eval()
     groups = []
@@ -36,31 +37,36 @@ def generate_grpo_rollout(
 
             input_lengths = [len(input_id) for input_id in inputs["input_ids"]]
 
-            generation = model.generate(
-                **inputs,
-                max_new_tokens=max_generation_length,
-                temperature=0.5,
-                do_sample=True,
-                use_cache=True,
-            )
-            output_ids = [
-                gen[input_lengths[i] :]
-                for i, gen in enumerate(generation.detach().tolist())
-            ]
+            if temperature != 0.0:
+                generation = model.generate(
+                    **inputs,
+                    max_new_tokens=max_generation_length,
+                    temperature=temperature,
+                    do_sample=True,
+                    use_cache=True,
+                )
+            else:
+                generation = model.generate(
+                    **inputs,
+                    max_new_tokens=max_generation_length,
+                    do_sample=False,
+                    use_cache=True,
+                )
+
+            output_ids = [gen[input_lengths[i] :] for i, gen in enumerate(generation.detach().tolist())]
 
             responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
             ground_truth = [batch_data.expected_outputs[sampl_id]] * num_rollouts
 
-            rewards = {
-                reward.name: reward.fn(responses, ground_truth) * reward.weight
-                for reward in reward_functions
-            }
+            rewards = {reward.name: reward.fn(responses, ground_truth) * reward.weight for reward in reward_functions}
 
             group = Group(
                 input_text=batch_data.inputs[sampl_id],
                 ground_truth=batch_data.expected_outputs[sampl_id],
                 responses=responses,
                 rewards=rewards,
+                output_ids=torch.tensor(output_ids, device=device),
+                input_ids=inputs["input_ids"],
             )
 
             groups.append(group)
@@ -87,15 +93,11 @@ if __name__ == "__main__":
 
     model_id = "google/gemma-3-4b-it"
 
-    model = Gemma3ForConditionalGeneration.from_pretrained(
-        model_id, device_map="auto", torch_dtype=torch.bfloat16
-    ).eval()
+    model = Gemma3ForConditionalGeneration.from_pretrained(model_id, device_map="auto", torch_dtype=torch.bfloat16).eval()
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     structure_reward_fn = Reward(name="structure_reward", weight=1, fn=structure_reward)
-    translation_reward_fn = Reward(
-        name="translation_reward", weight=1, fn=translation_reward
-    )
+    translation_reward_fn = Reward(name="translation_reward", weight=1, fn=translation_reward)
 
     dataloader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
     for batch in dataloader:
