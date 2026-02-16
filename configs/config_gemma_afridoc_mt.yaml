@@ -1,5 +1,5 @@
 model:
-  pretrained_model_path: "google/gemma-3-4b-it"
+  pretrained_model_path: "Qwen/Qwen2.5-1.5B-Instruct"
   dtype: "bfloat16"
 
 train_dataset:
@@ -17,7 +17,7 @@ eval_dataset:
   dataset_name_or_path: "masakhane/AfriDocMT"
   split: "validation"
   subset: "doc_health_5"
-  num_samples: 10
+  num_samples: 4
   source_languages:
     - yo
   target_language: "en"
@@ -33,7 +33,7 @@ rewards:
     weight: 1
 
 training:
-  num_rollouts: 4
+  num_rollouts: 1
   learning_rate: 0.00001
   num_epochs: 3
   max_generation_length: 4096
@@ -42,6 +42,6 @@ training:
 
 wandb:
   project: "grpo_scratch"
-  run_name: "gemma_afridoc_mt_test"
+  run_name: "qwen_afridoc_mt_test"
   entity: "jarmy-naija"
   log_rollouts_table: true

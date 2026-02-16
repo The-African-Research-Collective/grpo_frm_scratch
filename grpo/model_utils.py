@@ -4,7 +4,7 @@ from transformers import AutoModel, AutoTokenizer
 from typing import List
 from tqdm import tqdm
 
-from grpo.data_class import MiniBatch, Group, Reward
+from data_class import MiniBatch, Group, Reward
 
 
 def generate_grpo_rollout(
@@ -15,14 +15,13 @@ def generate_grpo_rollout(
     max_generation_length: int,
     reward_functions: List[Reward],
     device: torch.device,
-    dtype: torch.dtype,
     temperature: float = 0.5,
 ) -> List[Group]:
     model.eval()
     groups = []
 
     # 1. for each input in the batch, generate num_generations continuations using the model
-    with torch.autocast(device_type=device.type, dtype=dtype):
+    with torch.autocast(device_type=device.type, dtype=getattr(model, "dtype", None)):
         for sampl_id in tqdm(range(len(batch_data.inputs)), desc="Generating rollouts"):
             messages = [batch_data.input_prompts[sampl_id] for i in range(num_rollouts)]
             inputs = tokenizer.apply_chat_template(

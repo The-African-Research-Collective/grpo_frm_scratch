@@ -7,7 +7,7 @@ from datasets import load_dataset
 from jinja2 import Environment
 from typing import Dict, List
 
-from grpo.data_class import MiniBatch
+from data_class import MiniBatch
 
 SYSTEM_PROMPT = """You are a helpful assistant for translating documents for low-resource languages
 You first think about the reasoning process to translate the document, and then provide the final answer
@@ -102,9 +102,7 @@ class AfriDocMTDataset(Dataset):
 
         for lang in source_languages:
             trimmed_df = df[[lang, target_language]]
-            trimmed_df = trimmed_df.rename(
-                columns={lang: "source_text", target_language: "target_text"}
-            )
+            trimmed_df = trimmed_df.rename(columns={lang: "source_text", target_language: "target_text"})
             trimmed_df["source_language"] = MAPPING[lang]
             trimmed_df["target_language"] = MAPPING[target_language]
 
