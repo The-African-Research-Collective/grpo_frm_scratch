@@ -1,15 +1,29 @@
 import torch
+from torch.nn import functional as F
 
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
 from typing import List
 from tqdm import tqdm
 
 from data_class import MiniBatch, Group, Reward
 
 
+def selective_log_softmax(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """
+    logits: (B, T, V)
+    labels: (B, T) token ids
+    returns: (B, T) log p(label_t | ...)
+    """
+    return F.log_softmax(logits, dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+
+
+# ----------------------------
+# Rollout generation (also computes sampling_per_token_logps)
+# ----------------------------
+@torch.no_grad()
 def generate_grpo_rollout(
     batch_data: MiniBatch,
-    model: AutoModel,
+    model: torch.nn.Module,
     tokenizer: AutoTokenizer,
     num_rollouts: int,
     max_generation_length: int,
@@ -18,58 +32,102 @@ def generate_grpo_rollout(
     temperature: float = 0.5,
 ) -> List[Group]:
     model.eval()
-    groups = []
+    groups: List[Group] = []
 
-    # 1. for each input in the batch, generate num_generations continuations using the model
-    with torch.autocast(device_type=device.type, dtype=getattr(model, "dtype", None)):
-        for sampl_id in tqdm(range(len(batch_data.inputs)), desc="Generating rollouts"):
-            messages = [batch_data.input_prompts[sampl_id] for i in range(num_rollouts)]
-            inputs = tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                padding=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
-            input_lengths = [len(input_id) for input_id in inputs["input_ids"]]
+    for sampl_id in tqdm(range(len(batch_data.inputs)), desc="Generating rollouts", leave=False):
+        messages = [batch_data.input_prompts[sampl_id] for _ in range(num_rollouts)]
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            padding=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            if temperature != 0.0:
-                generation = model.generate(
-                    **inputs,
-                    max_new_tokens=max_generation_length,
-                    temperature=temperature,
-                    do_sample=True,
-                    use_cache=True,
-                )
-            else:
-                generation = model.generate(
-                    **inputs,
-                    max_new_tokens=max_generation_length,
-                    do_sample=False,
-                    use_cache=True,
-                )
+        gen_kwargs = dict(
+            max_new_tokens=max_generation_length,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        if temperature and temperature != 0.0:
+            gen_kwargs.update(dict(do_sample=True, temperature=temperature))
+        else:
+            gen_kwargs.update(dict(do_sample=False))
 
-            output_ids = [gen[input_lengths[i] :] for i, gen in enumerate(generation.detach().tolist())]
+        generation = model.generate(**inputs, **gen_kwargs)  # (R, P+C_gen)
 
-            responses = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-            ground_truth = [batch_data.expected_outputs[sampl_id]] * num_rollouts
+        # prompt lengths from attention_mask (left padding)
+        prompt_lens = inputs["attention_mask"].sum(dim=1).tolist()
+        gen_list = generation.detach().tolist()
 
-            rewards = {reward.name: reward.fn(responses, ground_truth) * reward.weight for reward in reward_functions}
+        # Extract completion suffix per rollout
+        completion_ragged: List[List[int]] = []
+        for i, seq in enumerate(gen_list):
+            p = int(prompt_lens[i])
+            completion_ragged.append(seq[-(len(seq) - p) :])
 
-            group = Group(
-                input_text=batch_data.inputs[sampl_id],
-                ground_truth=batch_data.expected_outputs[sampl_id],
-                responses=responses,
-                rewards=rewards,
-                output_ids=torch.tensor(output_ids, device=device),
-                input_ids=inputs["input_ids"],
-            )
+        max_c = max(len(x) for x in completion_ragged)
+        R = len(completion_ragged)
 
-            groups.append(group)
+        completion_ids = torch.full((R, max_c), tokenizer.pad_token_id, dtype=torch.long)
+        completion_mask = torch.zeros((R, max_c), dtype=torch.long)
 
+        for i, comp in enumerate(completion_ragged):
+            L = len(comp)
+            completion_ids[i, :L] = torch.tensor(comp, dtype=torch.long)
+            completion_mask[i, :L] = 1
+
+        prompt_ids = inputs["input_ids"].detach().cpu()  # (R, P_pad)
+        attn_prompt = inputs["attention_mask"].detach().cpu()  # (R, P_pad)
+
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (R, P_pad+max_c)
+        attention_mask = torch.cat([attn_prompt, completion_mask], dim=1)  # (R, P_pad+max_c)
+
+        # sampling_per_token_logps (under rollout policy = model at generation time)
+        pc_ids = prompt_completion_ids.to(device)
+        pc_mask = attention_mask.to(device)
+        out = model(input_ids=pc_ids, attention_mask=pc_mask, use_cache=False)
+        logits = out.logits  # (R, P_pad+max_c, V)
+
+        labels = pc_ids[:, 1:]
+        logits = logits[:, :-1, :]
+
+        comp_labels = labels[:, -max_c:]
+        comp_logits = logits[:, -max_c:, :]
+
+        sampling_per_token_logps = selective_log_softmax(comp_logits, comp_labels)  # (R, max_c)
+        sampling_per_token_logps = sampling_per_token_logps * completion_mask.to(device)
+
+        responses = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+
+        ground_truth = [batch_data.expected_outputs[sampl_id]] * num_rollouts
+        rewards = {rf.name: (rf.fn(responses, ground_truth) * rf.weight) for rf in reward_functions}
+
+        group = Group(
+            input_text=batch_data.inputs[sampl_id],
+            ground_truth=batch_data.expected_outputs[sampl_id],
+            responses=responses,
+            rewards=rewards,
+            prompt_ids=prompt_ids,
+            completion_ids=completion_ids,
+            prompt_completion_ids=prompt_completion_ids,
+            attention_mask=attention_mask,
+            completion_mask=completion_mask,
+            sampling_per_token_logps=sampling_per_token_logps.detach().cpu(),
+        )
+        groups.append(group)
+
+        del inputs, generation, out
+        torch.cuda.empty_cache()
+
+    model.train()
     return groups
 
 
