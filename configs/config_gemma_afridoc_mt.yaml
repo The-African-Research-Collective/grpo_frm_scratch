@@ -2,26 +2,35 @@ model:
   pretrained_model_path: "google/gemma-3-4b-it"
   dtype: "bfloat16"
 
-train_dataset:
-  dataset_name_or_path: "masakhane/AfriDocMT"
-  split: "train"
-  subset: "doc_health_5"
-  num_samples: -1
-  source_languages:
-    - yo
-  target_language: "en"
-  batch_size: 2
-  dataset_class_name: "afridoc_mt"
+train_datasets:
+  - name: yo_en
+    dataset_name_or_path: "masakhane/AfriDocMT"
+    split: "train"
+    subset: "doc_health_5"
+    num_samples: -1
+    source_languages:
+      - yo
+    target_language: "en"
+    dataset_class_name: "afridoc_mt"
+  
+  - name: en_yo
+    dataset_name_or_path: "masakhane/AfriDocMT"
+    split: "train"
+    subset: "doc_health_5"
+    num_samples: -1
+    source_languages:
+      - en
+    target_language: "yo"
+    dataset_class_name: "afridoc_mt"
 
 eval_dataset:
   dataset_name_or_path: "masakhane/AfriDocMT"
   split: "validation"
   subset: "doc_health_5"
-  num_samples: 64
+  num_samples: -1
   source_languages:
     - yo
   target_language: "en"
-  batch_size: 8
   dataset_class_name: "afridoc_mt"
 
 rewards:
@@ -40,7 +49,17 @@ training:
   weight_decay: 0.01
   max_grad_norm: 0.1
   beta: 0.0
-  epsilon: 0.2
+  epsilon_low: 0.2
+  epsilom_high: 0.2
+  eval_each_epoch: true
+  checkpointing_steps: "epoch"
+  output_dir: "runs"
+  overwrite_output_dir: true
+  train_batch_size: 2
+  eval_batch_size: 16
+  warmup_ratio: 0.1
+  keep_last_n_checkpoints: 2
+  lr_scheduler_type: linear # cosine, cosine_with_restarts, polynomial
 
 wandb:
   project: "grpo_scratch"

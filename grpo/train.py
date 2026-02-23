@@ -12,7 +12,7 @@ Notes:
   prompt+completion under the *same model at rollout time*. This matches TRL's need for
   sampling logps (i.e., log-probs under the rollout policy).
 """
-
+import os
 import argparse
 import logging
 import pprint
@@ -22,21 +22,21 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import wandb
 import yaml
 from accelerate import Accelerator
 from accelerate.utils import DataLoaderConfiguration, InitProcessGroupKwargs, gather_object
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 
 from rewards import structure_reward, translation_reward
 from datasets_classes import AfriDocMTDataset
-from data_class import Group, Reward
-from model_utils import generate_grpo_rollout
+from data_class import Reward
+from model_utils import generate_grpo_rollout, get_last_checkpoint_path, clean_last_n_checkpoints
+from grpo import grpo_loss
 
 
 # ----------------------------
@@ -59,82 +59,10 @@ DATASET_CLASSES = {
 }
 
 
-def selective_log_softmax(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """
-    logits: (B, T, V)
-    labels: (B, T) token ids
-    returns: (B, T) log p(label_t | ...)
-    """
-    return F.log_softmax(logits, dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
-
-
 def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     probs = torch.nn.functional.softmax(logits, dim=-1)
     entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
     return entropy
-
-
-def grpo_loss(
-    model: torch.nn.Module,
-    ref_model: Optional[torch.nn.Module],
-    group: Group,
-    advantages: torch.Tensor,  # (R,)
-    beta: float,
-    epsilon_low: float,
-    epsilon_high: float,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Matches TRL's GRPOTrainer "grpo" loss branch:
-      - importance ratio: exp(cur_logps - sampling_logps)
-      - clipped ratio
-      - per-token objective: -min(r*A, clip(r)*A)
-      - optional KL penalty: exp(ref-cur) - (ref-cur) - 1, multiplied by beta
-      - masked mean over completion tokens
-    """
-
-    pc_ids = group.prompt_completion_ids.to(device)  # (R, P+C)
-    attn = group.attention_mask.to(device)  # (R, P+C)
-    cmask = group.completion_mask.to(device).float()  # (R, C)
-    sampling_logps = group.sampling_per_token_logps.to(device)  # (R, C)
-
-    # Forward current policy
-    out = model(input_ids=pc_ids, attention_mask=attn, use_cache=False)
-    logits = out.logits  # (R, P+C, V)
-
-    # next-token alignment
-    labels = pc_ids[:, 1:]  # (R, P+C-1)
-    logits = logits[:, :-1, :]  # (R, P+C-1, V)
-
-    C = cmask.size(1)
-    comp_labels = labels[:, -C:]  # (R, C)
-    comp_logits = logits[:, -C:, :]  # (R, C, V)
-
-    per_token_logps = selective_log_softmax(comp_logits, comp_labels) * cmask  # (R, C)
-
-    # Importance ratio
-    log_iw = per_token_logps - sampling_logps
-    coef_1 = torch.exp(log_iw)
-    coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
-
-    adv = advantages.to(device).float().unsqueeze(1)  # (R, 1)
-    per_token_loss = -torch.min(coef_1 * adv, coef_2 * adv)  # (R, C)
-
-    # Optional KL penalty against reference
-    if ref_model is not None and beta != 0.0:
-        with torch.no_grad():
-            ref_out = ref_model(input_ids=pc_ids, attention_mask=attn, use_cache=False)
-            ref_logits = ref_out.logits[:, :-1, :]  # align
-            ref_comp_logits = ref_logits[:, -C:, :]
-            ref_per_token_logps = selective_log_softmax(ref_comp_logits, comp_labels) * cmask
-
-        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-        per_token_loss = per_token_loss + beta * per_token_kl
-
-    # masked mean over completion tokens
-    denom = cmask.sum(dim=1).clamp(min=1.0)
-    loss = ((per_token_loss * cmask).sum(dim=1) / denom).mean()
-    return loss
 
 
 # ----------------------------
@@ -147,7 +75,6 @@ def evaluate(
     eval_dataloader: DataLoader,
     rewards: List[Reward],
     tokenizer: AutoTokenizer,
-    global_step: int,
     num_eval_rollouts: int = 1,
     max_generation_length: int = 512,
     log_rollouts_table: bool = True,
@@ -247,6 +174,8 @@ def main(config_path: str):
         config = yaml.safe_load(f)
 
     logger.info(f"Loaded configuration:\n{pprint.pformat(config)}")
+    
+    training_config = config["training"]
 
     timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=1800))
     dataloader_config = DataLoaderConfiguration()
@@ -277,7 +206,7 @@ def main(config_path: str):
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # reference model (optional KL)
-    beta = float(config["training"].get("beta", 0.0))
+    beta = float(training_config.get("beta", 0.0))
     ref_model = None
     if beta != 0.0:
         ref_model = AutoModelForCausalLM.from_pretrained(
@@ -289,18 +218,25 @@ def main(config_path: str):
         for p in ref_model.parameters():
             p.requires_grad = False
 
-    # datasets/dataloaders
-    dataset_class = DATASET_CLASSES[config["train_dataset"]["dataset_class_name"]]
-
-    train_dataset = dataset_class(
-        dataset_name_or_path=config["train_dataset"]["dataset_name_or_path"],
-        split=config["train_dataset"]["split"],
-        subset=config["train_dataset"]["subset"],
-        num_samples=config["train_dataset"]["num_samples"],
-        tokenizer=tokenizer,
-        source_languages=config["train_dataset"]["source_languages"],
-        target_language=config["train_dataset"]["target_language"],
-    )
+    # datasets/dataloaders    
+    all_dataset = []
+    
+    for ds in config["train_datasets"]:
+        dataset_class = DATASET_CLASSES[ds["dataset_class_name"]]
+        
+        train_dataset = dataset_class(
+            dataset_name_or_path=ds["dataset_name_or_path"],
+            split=ds["split"],
+            subset=ds["subset"],
+            num_samples=ds["num_samples"],
+            tokenizer=tokenizer,
+            source_languages=ds["source_languages"],
+            target_language=ds["target_language"],
+        )
+        all_dataset.append(train_dataset)
+    
+    final_train_dataset = ConcatDataset(all_dataset)
+    
     eval_dataset = dataset_class(
         dataset_name_or_path=config["eval_dataset"]["dataset_name_or_path"],
         split=config["eval_dataset"]["split"],
@@ -312,14 +248,14 @@ def main(config_path: str):
     )
 
     train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=config["train_dataset"]["batch_size"],
+        final_train_dataset,
+        batch_size=training_config["train_batch_size"],
         collate_fn=dataset_class.collate_fn,
         shuffle=True,
     )
     eval_dataloader = DataLoader(
         eval_dataset,
-        batch_size=config["eval_dataset"]["batch_size"],
+        batch_size=training_config["eval_batch_size"],
         collate_fn=dataset_class.collate_fn,
         shuffle=False,
     )
@@ -329,17 +265,25 @@ def main(config_path: str):
     optimizer_grouped_parameters = [
         {
             "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": float(config["training"]["weight_decay"]),
+            "weight_decay": float(training_config["weight_decay"]),
         },
         {
             "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
         },
     ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=float(config["training"]["learning_rate"]))
+    optimizer = AdamW(optimizer_grouped_parameters, lr=float(training_config["learning_rate"]))
+    num_training_steps_for_scheduler = training_config["num_epochs"] * len(train_dataloader)
+    
+    lr_scheduler = get_scheduler(
+        name=training_config["lr_scheduler_type"],
+        optimizer=optimizer,
+        num_training_steps=num_training_steps_for_scheduler,
+        num_warmup_steps=int(num_training_steps_for_scheduler * training_config["warmup_ratio"]),
+    )
 
     # prepare
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(model, optimizer, train_dataloader, eval_dataloader)
+    model, optimizer, lr_scheduler,  train_dataloader, eval_dataloader = accelerator.prepare(model, optimizer, lr_scheduler, train_dataloader, eval_dataloader)
 
     # wandb init
     wandb_cfg = config.get("wandb", {})
@@ -350,12 +294,12 @@ def main(config_path: str):
     )
 
     # training params
-    epsilon_low = float(config["training"].get("epsilon_low", 0.2))
-    epsilon_high = float(config["training"].get("epsilon_high", 0.2))
-    max_grad_norm = float(config["training"].get("max_grad_norm", 1.0))
-    num_rollouts = int(config["training"]["num_rollouts"])
-    max_gen_len = int(config["training"]["max_generation_length"])
-    num_epochs = int(config["training"]["num_epochs"])
+    epsilon_low = float(training_config.get("epsilon_low", 0.2))
+    epsilon_high = float(training_config.get("epsilon_high", 0.2))
+    max_grad_norm = float(training_config.get("max_grad_norm", 1.0))
+    num_rollouts = int(training_config["num_rollouts"])
+    max_gen_len = int(training_config["max_generation_length"])
+    num_epochs = int(training_config["num_epochs"])
     log_rollouts_table = bool(config.get("wandb", {}).get("log_rollouts_table", False))
 
     # Run eval before trainining
@@ -365,12 +309,12 @@ def main(config_path: str):
         eval_dataloader=eval_dataloader,
         rewards=rewards,
         tokenizer=tokenizer,
-        global_step=0,
     )
     accelerator.log(eval_logs, step=0)
 
     start_time = time.time()
     global_step = 0
+    wandb.watch(model, log='all')
 
     for epoch in range(num_epochs):
         logger.info(f"Starting epoch {epoch + 1}/{num_epochs}...")
@@ -388,7 +332,7 @@ def main(config_path: str):
                 max_generation_length=max_gen_len,
                 reward_functions=rewards,
                 device=accelerator.device,
-                temperature=float(config["training"].get("temperature", 0.7)),
+                temperature=float(training_config.get("temperature", 0.7)),
             )
 
             accelerator.wait_for_everyone()
@@ -451,6 +395,7 @@ def main(config_path: str):
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                     optimizer.step()
+                    lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
             # reduce metrics
@@ -469,6 +414,7 @@ def main(config_path: str):
                 "train/time_elapsed_sec": float(time.time() - start_time),
                 "train/reward_mean": rew_mg,
                 "train/reward_std": rew_sg,
+                "train/learning_rate": lr_scheduler.get_last_lr()[0]
             }
 
             if log_rollouts_table:
@@ -480,7 +426,7 @@ def main(config_path: str):
             accelerator.log(log_payload, step=global_step)
 
         # Optional: eval each epoch
-        if config["training"].get("eval_each_epoch", False):
+        if training_config.get("eval_each_epoch", False):
             eval_logs = evaluate(
                 accelerator=accelerator,
                 model=model,
@@ -494,8 +440,32 @@ def main(config_path: str):
                 table_name="eval/rollouts_table",
             )
             accelerator.log(eval_logs, step=global_step)
+        
+        if training_config["checkpointing_steps"] == "epoch":
+            output_dir = f"epoch_{epoch}"
+            if training_config["output_dir"] is not None:
+                output_dir = os.path.join(training_config["output_dir"], output_dir)
+                
+            accelerator.save_state(output_dir)
+            
+            # use this to mark the checkpoint as completely saved, to avoid restoring from garbled checkpoints
+            with open(
+                os.path.join(
+                    get_last_checkpoint_path(config, incomplete=True), "COMPLETED"
+                ),
+                "w",
+            ) as f:
+                f.write(
+                    "COMPLETED"
+                )  # annoyingly, empty files arent uploaded by beaker.
+            if accelerator.is_local_main_process:
+                clean_last_n_checkpoints(
+                    output_dir, training_config["keep_last_n_checkpoints"]
+                )
+            accelerator.wait_for_everyone()
 
     accelerator.print("Training complete.")
+    
 
 
 if __name__ == "__main__":

@@ -1,11 +1,16 @@
+import os
 import torch
+import shutil
+from accelerate.logging import get_logger
 from torch.nn import functional as F
 
 from transformers import AutoTokenizer
-from typing import List
+from typing import List, Optional
 from tqdm import tqdm
 
 from data_class import MiniBatch, Group, Reward
+
+logger = get_logger(__name__)
 
 
 def selective_log_softmax(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -130,10 +135,71 @@ def generate_grpo_rollout(
     model.train()
     return groups
 
+def get_last_checkpoint(folder: str, incomplete: bool = False) -> Optional[str]:
+    content = os.listdir(folder)
+    checkpoint_steps = [path for path in content if path.startswith("step_")]
+    checkpoint_epochs = [path for path in content if path.startswith("epoch_")]
+    if len(checkpoint_steps) > 0 and len(checkpoint_epochs) > 0:
+        logger.info("Mixed step and epoch checkpoints found. Using step checkpoints.")
+        checkpoints = checkpoint_steps
+    elif len(checkpoint_steps) == 0:
+        checkpoints = checkpoint_epochs
+    else:
+        checkpoints = checkpoint_steps
+    if not incomplete:
+        checkpoints = [
+            path
+            for path in checkpoints
+            if os.path.exists(os.path.join(folder, path, "COMPLETED"))
+        ]
+    if len(checkpoints) == 0:
+        return
+    return os.path.join(folder, max(checkpoints, key=lambda x: x.split("_")[-1]))
+
+
+def get_last_checkpoint_path(config, incomplete: bool = False) -> str:
+    # if output already exists and user does not allow overwriting, resume from there.
+    # otherwise, resume if the user specifies a checkpoint.
+    # else, start from scratch.
+    # if incomplete is true, include folders without "COMPLETE" in the folder.
+    last_checkpoint_path = None
+    output_dir = config["training"]["output_dir"]
+    
+    if (
+        output_dir
+        and os.path.isdir(output_dir)
+        and not config["training"]["overwrite_output_dir"]
+    ):
+        last_checkpoint_path = get_last_checkpoint(
+            output_dir, incomplete=incomplete
+        )
+        if last_checkpoint_path is None:
+            logger.warning(
+                "Output directory exists but no checkpoint found. Starting from scratch."
+            )
+    return last_checkpoint_path
+
+def is_checkpoint_folder(dir: str, folder: str) -> bool:
+    return (
+        folder.startswith("step_") or folder.startswith("epoch_")
+    ) and os.path.isdir(os.path.join(dir, folder))
+
+def clean_last_n_checkpoints(output_dir: str, keep_last_n_checkpoints: int) -> None:
+    # remove the last checkpoint to save space
+    folders = [f for f in os.listdir(output_dir) if is_checkpoint_folder(output_dir, f)]
+    # find the checkpoint with the largest step
+    checkpoints = sorted(folders, key=lambda x: int(x.split("_")[-1]))
+    if keep_last_n_checkpoints != -1 and len(checkpoints) > keep_last_n_checkpoints:
+        for checkpoint in checkpoints[: len(checkpoints) - keep_last_n_checkpoints]:
+            logger.info(f"Removing checkpoint {checkpoint}")
+            shutil.rmtree(os.path.join(output_dir, checkpoint))
+    logger.info("Remaining files:" + str(os.listdir(output_dir)))
+
+
 
 if __name__ == "__main__":
-    from grpo.afridoc_mt import AfriDocMTDataset, collate_fn
-    from grpo.rewards import structure_reward, translation_reward
+    from datasets_classes import AfriDocMTDataset, collate_fn
+    from rewards import structure_reward, translation_reward
     from grpo.data_class import Reward
     from torch.utils.data import DataLoader
     from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
@@ -166,6 +232,5 @@ if __name__ == "__main__":
             max_generation_length=4096,
             reward_functions=[structure_reward_fn, translation_reward_fn],
             device=model.device,
-            dtype=torch.bfloat16,
         )
         break
